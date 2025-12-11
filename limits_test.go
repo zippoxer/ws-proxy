@@ -11,7 +11,7 @@ import (
 	"testing"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 func TestDefaultLimits(t *testing.T) {
@@ -292,7 +292,7 @@ func TestMessageSizeLimitEnforced(t *testing.T) {
 	// The write might succeed but the next read should fail
 	// because the server closes the connection when limit is exceeded
 
-	// Note: nhooyr.io/websocket enforces read limit on the server side,
+	// Note: github.com/coder/websocket enforces read limit on the server side,
 	// so the server will close when receiving oversized message.
 	// This test verifies the limit is applied.
 }

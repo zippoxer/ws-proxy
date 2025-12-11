@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // mockTCPServer is a test TCP server that captures the PROXY v2 header and echoes data.

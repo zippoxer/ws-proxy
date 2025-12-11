@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 func TestMalformedXForwardedFor(t *testing.T) {

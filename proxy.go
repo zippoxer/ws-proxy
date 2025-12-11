@@ -12,7 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // bufferPool reuses 32KB buffers for TCP reads to reduce GC pressure.

@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 // echoTCPServer is a TCP server that reads PROXY header and echoes all data

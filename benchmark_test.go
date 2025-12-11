@@ -11,7 +11,7 @@ import (
 	"sync"
 	"testing"
 
-	"nhooyr.io/websocket"
+	"github.com/coder/websocket"
 )
 
 func BenchmarkProxyV2HeaderBuild(b *testing.B) {
