@@ -15,17 +15,26 @@ import (
 	"nhooyr.io/websocket"
 )
 
+// bufferPool reuses 32KB buffers for TCP reads to reduce GC pressure.
+var bufferPool = sync.Pool{
+	New: func() any {
+		buf := make([]byte, 32*1024)
+		return &buf
+	},
+}
+
 // ProxyHandler handles WebSocket to TCP proxying with PROXY protocol v2 support.
 type ProxyHandler struct {
-	BackendAddr       string
-	Logger            *slog.Logger
-	MaxMessageSize    int64
-	ConnectTimeout    time.Duration
-	ReadTimeout       time.Duration
-	WriteTimeout      time.Duration
-	MaxConnections    int
-	TrustProxyHeaders bool     // Trust X-Forwarded-For/X-Real-IP headers
-	AllowedOrigins    []string // Allowed WebSocket origins (empty = allow all)
+	BackendAddr         string
+	resolvedBackendAddr string // Cached resolved address (IP:port) to avoid DNS lookups per connection
+	Logger              *slog.Logger
+	MaxMessageSize      int64
+	ConnectTimeout      time.Duration
+	ReadTimeout         time.Duration
+	WriteTimeout        time.Duration
+	MaxConnections      int
+	TrustProxyHeaders   bool     // Trust X-Forwarded-For/X-Real-IP headers
+	AllowedOrigins      []string // Allowed WebSocket origins (empty = allow all)
 
 	// activeConns tracks the number of active connections for MaxConnections enforcement
 	activeConns atomic.Int64
@@ -33,17 +42,61 @@ type ProxyHandler struct {
 
 // NewProxyHandler creates a new ProxyHandler with the given configuration.
 func NewProxyHandler(cfg Config, logger *slog.Logger) *ProxyHandler {
+	// Resolve backend address once at startup to avoid DNS lookups per connection
+	resolvedAddr := resolveBackendAddr(cfg.BackendAddr, logger)
+
 	return &ProxyHandler{
-		BackendAddr:       cfg.BackendAddr,
-		Logger:            logger,
-		MaxMessageSize:    cfg.MaxMessageSize,
-		ConnectTimeout:    cfg.ConnectTimeout,
-		ReadTimeout:       cfg.ReadTimeout,
-		WriteTimeout:      cfg.WriteTimeout,
-		MaxConnections:    cfg.MaxConnections,
-		TrustProxyHeaders: cfg.TrustProxyHeaders,
-		AllowedOrigins:    cfg.AllowedOrigins,
+		BackendAddr:         cfg.BackendAddr,
+		resolvedBackendAddr: resolvedAddr,
+		Logger:              logger,
+		MaxMessageSize:      cfg.MaxMessageSize,
+		ConnectTimeout:      cfg.ConnectTimeout,
+		ReadTimeout:         cfg.ReadTimeout,
+		WriteTimeout:        cfg.WriteTimeout,
+		MaxConnections:      cfg.MaxConnections,
+		TrustProxyHeaders:   cfg.TrustProxyHeaders,
+		AllowedOrigins:      cfg.AllowedOrigins,
 	}
+}
+
+// resolveBackendAddr resolves a hostname:port to IP:port.
+// If the address is already an IP or resolution fails, returns the original address.
+func resolveBackendAddr(addr string, logger *slog.Logger) string {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		logger.Warn("could not parse backend address, using as-is", "addr", addr, "error", err)
+		return addr
+	}
+
+	// Check if host is already an IP address
+	if ip := net.ParseIP(host); ip != nil {
+		return addr // Already an IP, no resolution needed
+	}
+
+	// Resolve hostname to IP
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		logger.Warn("DNS resolution failed for backend, using hostname", "host", host, "error", err)
+		return addr
+	}
+
+	// Prefer IPv4 for consistency
+	for _, ip := range ips {
+		if ipv4 := ip.To4(); ipv4 != nil {
+			resolved := net.JoinHostPort(ipv4.String(), port)
+			logger.Info("resolved backend address", "original", addr, "resolved", resolved)
+			return resolved
+		}
+	}
+
+	// Fall back to first IP if no IPv4 found
+	if len(ips) > 0 {
+		resolved := net.JoinHostPort(ips[0].String(), port)
+		logger.Info("resolved backend address (IPv6)", "original", addr, "resolved", resolved)
+		return resolved
+	}
+
+	return addr
 }
 
 // ActiveConnections returns the current number of active connections.
@@ -96,12 +149,16 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	logger.Info("websocket connection accepted")
 
-	// Connect to backend TCP server with timeout
+	// Connect to backend TCP server with timeout (using resolved address to avoid DNS per connection)
+	backendAddr := p.resolvedBackendAddr
+	if backendAddr == "" {
+		backendAddr = p.BackendAddr // Fallback for tests that don't use NewProxyHandler
+	}
 	var tcpConn net.Conn
 	if p.ConnectTimeout > 0 {
-		tcpConn, err = net.DialTimeout("tcp", p.BackendAddr, p.ConnectTimeout)
+		tcpConn, err = net.DialTimeout("tcp", backendAddr, p.ConnectTimeout)
 	} else {
-		tcpConn, err = net.Dial("tcp", p.BackendAddr)
+		tcpConn, err = net.Dial("tcp", backendAddr)
 	}
 	if err != nil {
 		logger.Error("failed to connect to backend", "error", err)
@@ -251,7 +308,10 @@ func (p *ProxyHandler) wsToTCP(ctx context.Context, wsConn *websocket.Conn, tcpC
 
 // tcpToWS reads from TCP and writes binary messages to WebSocket.
 func (p *ProxyHandler) tcpToWS(ctx context.Context, tcpConn net.Conn, wsConn *websocket.Conn) error {
-	buf := make([]byte, 32*1024) // 32KB buffer
+	bufPtr := bufferPool.Get().(*[]byte)
+	buf := *bufPtr
+	defer bufferPool.Put(bufPtr)
+
 	for {
 		// Set read deadline for idle timeout (reset after each read)
 		if p.ReadTimeout > 0 {

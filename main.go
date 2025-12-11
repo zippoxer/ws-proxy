@@ -33,10 +33,12 @@ func main() {
 	// Create proxy handler
 	handler := NewProxyHandler(cfg, logger)
 
-	// Create HTTP server
+	// Create HTTP server with timeouts to prevent slowloris attacks
 	server := &http.Server{
-		Addr:    cfg.ListenAddr,
-		Handler: handler,
+		Addr:              cfg.ListenAddr,
+		Handler:           handler,
+		ReadHeaderTimeout: 10 * time.Second, // Time to read request headers
+		IdleTimeout:       120 * time.Second, // Keep-alive timeout
 	}
 
 	// Channel to signal server shutdown
