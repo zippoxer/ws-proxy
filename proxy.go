@@ -122,8 +122,12 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Accept WebSocket connection with origin checking
-	acceptOpts := &websocket.AcceptOptions{}
+	// Accept WebSocket connection with origin checking and subprotocol negotiation
+	acceptOpts := &websocket.AcceptOptions{
+		// Support "binary" subprotocol required by Emscripten WebSocket clients.
+		// Chrome rejects the handshake if the server doesn't echo the requested subprotocol.
+		Subprotocols: []string{"binary"},
+	}
 	if len(p.AllowedOrigins) == 0 {
 		// No origins configured - allow all (for non-browser clients like game clients)
 		acceptOpts.InsecureSkipVerify = true
