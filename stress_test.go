@@ -343,14 +343,16 @@ func TestStress_MemoryStability(t *testing.T) {
 	var finalStats runtime.MemStats
 	runtime.ReadMemStats(&finalStats)
 
-	// Memory should return close to baseline
-	memGrowthMB := float64(finalStats.HeapAlloc-baselineStats.HeapAlloc) / 1024 / 1024
-	t.Logf("Memory growth: %.2f MB (baseline: %.2f MB, final: %.2f MB)",
-		memGrowthMB,
-		float64(baselineStats.HeapAlloc)/1024/1024,
-		float64(finalStats.HeapAlloc)/1024/1024)
+	// Memory should return close to baseline (or decrease, which is fine)
+	baselineMB := float64(baselineStats.HeapAlloc) / 1024 / 1024
+	finalMB := float64(finalStats.HeapAlloc) / 1024 / 1024
+	memGrowthMB := finalMB - baselineMB
+
+	t.Logf("Memory: baseline=%.2f MB, final=%.2f MB, growth=%.2f MB",
+		baselineMB, finalMB, memGrowthMB)
 
 	// Allow up to 50MB growth (generous to account for test framework, etc.)
+	// Negative growth (memory decreased) is fine
 	if memGrowthMB > 50 {
 		t.Errorf("excessive memory growth: %.2f MB", memGrowthMB)
 	}
