@@ -103,11 +103,12 @@ func TestIntegration_WebSocketToTCP(t *testing.T) {
 
 	go mockServer.Accept(t)
 
-	// Create proxy handler
+	// Create proxy handler (with TrustProxyHeaders for this test)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	handler := &ProxyHandler{
-		BackendAddr: mockServer.Addr(),
-		Logger:      logger,
+		BackendAddr:       mockServer.Addr(),
+		Logger:            logger,
+		TrustProxyHeaders: true,
 	}
 
 	// Create test HTTP server with the proxy handler
@@ -199,11 +200,12 @@ func TestIntegration_XRealIP(t *testing.T) {
 
 	go mockServer.Accept(t)
 
-	// Create proxy handler
+	// Create proxy handler (with TrustProxyHeaders for this test)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	handler := &ProxyHandler{
-		BackendAddr: mockServer.Addr(),
-		Logger:      logger,
+		BackendAddr:       mockServer.Addr(),
+		Logger:            logger,
+		TrustProxyHeaders: true,
 	}
 
 	// Create test HTTP server
@@ -252,11 +254,12 @@ func TestIntegration_MultipleXForwardedFor(t *testing.T) {
 
 	go mockServer.Accept(t)
 
-	// Create proxy handler
+	// Create proxy handler (with TrustProxyHeaders for this test)
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	handler := &ProxyHandler{
-		BackendAddr: mockServer.Addr(),
-		Logger:      logger,
+		BackendAddr:       mockServer.Addr(),
+		Logger:            logger,
+		TrustProxyHeaders: true,
 	}
 
 	// Create test HTTP server
@@ -361,74 +364,128 @@ func TestIntegration_BidirectionalData(t *testing.T) {
 }
 
 func TestExtractClientIP(t *testing.T) {
-	handler := &ProxyHandler{
-		BackendAddr: "127.0.0.1:7171",
-		Logger:      slog.New(slog.NewTextHandler(io.Discard, nil)),
-	}
+	// Test with TrustProxyHeaders=true (trusts X-Forwarded-For and X-Real-IP)
+	t.Run("TrustProxyHeaders=true", func(t *testing.T) {
+		handler := &ProxyHandler{
+			BackendAddr:       "127.0.0.1:7171",
+			Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+			TrustProxyHeaders: true,
+		}
 
-	tests := []struct {
-		name       string
-		xff        string
-		xri        string
-		remoteAddr string
-		expected   string
-	}{
-		{
-			name:       "X-Forwarded-For single",
-			xff:        "203.0.113.50",
-			xri:        "",
-			remoteAddr: "127.0.0.1:12345",
-			expected:   "203.0.113.50",
-		},
-		{
-			name:       "X-Forwarded-For multiple",
-			xff:        "203.0.113.50, 10.0.0.1, 192.168.1.1",
-			xri:        "",
-			remoteAddr: "127.0.0.1:12345",
-			expected:   "203.0.113.50",
-		},
-		{
-			name:       "X-Real-IP",
-			xff:        "",
-			xri:        "198.51.100.25",
-			remoteAddr: "127.0.0.1:12345",
-			expected:   "198.51.100.25",
-		},
-		{
-			name:       "X-Forwarded-For takes precedence",
-			xff:        "203.0.113.50",
-			xri:        "198.51.100.25",
-			remoteAddr: "127.0.0.1:12345",
-			expected:   "203.0.113.50",
-		},
-		{
-			name:       "Fallback to RemoteAddr",
-			xff:        "",
-			xri:        "",
-			remoteAddr: "192.168.1.100:54321",
-			expected:   "192.168.1.100",
-		},
-	}
+		tests := []struct {
+			name       string
+			xff        string
+			xri        string
+			remoteAddr string
+			expected   string
+		}{
+			{
+				name:       "X-Forwarded-For single",
+				xff:        "203.0.113.50",
+				remoteAddr: "127.0.0.1:12345",
+				expected:   "203.0.113.50",
+			},
+			{
+				name:       "X-Forwarded-For multiple",
+				xff:        "203.0.113.50, 10.0.0.1, 192.168.1.1",
+				remoteAddr: "127.0.0.1:12345",
+				expected:   "203.0.113.50",
+			},
+			{
+				name:       "X-Real-IP",
+				xri:        "198.51.100.25",
+				remoteAddr: "127.0.0.1:12345",
+				expected:   "198.51.100.25",
+			},
+			{
+				name:       "X-Forwarded-For takes precedence",
+				xff:        "203.0.113.50",
+				xri:        "198.51.100.25",
+				remoteAddr: "127.0.0.1:12345",
+				expected:   "203.0.113.50",
+			},
+			{
+				name:       "Fallback to RemoteAddr",
+				remoteAddr: "192.168.1.100:54321",
+				expected:   "192.168.1.100",
+			},
+		}
 
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			req := &http.Request{
-				Header:     make(http.Header),
-				RemoteAddr: tt.remoteAddr,
-			}
-			if tt.xff != "" {
-				req.Header.Set("X-Forwarded-For", tt.xff)
-			}
-			if tt.xri != "" {
-				req.Header.Set("X-Real-IP", tt.xri)
-			}
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				req := &http.Request{
+					Header:     make(http.Header),
+					RemoteAddr: tt.remoteAddr,
+				}
+				if tt.xff != "" {
+					req.Header.Set("X-Forwarded-For", tt.xff)
+				}
+				if tt.xri != "" {
+					req.Header.Set("X-Real-IP", tt.xri)
+				}
 
-			got := handler.extractClientIP(req)
-			if got != tt.expected {
-				t.Errorf("extractClientIP() = %q, want %q", got, tt.expected)
-			}
-		})
-	}
+				got := handler.extractClientIP(req)
+				if got != tt.expected {
+					t.Errorf("extractClientIP() = %q, want %q", got, tt.expected)
+				}
+			})
+		}
+	})
+
+	// Test with TrustProxyHeaders=false (ignores X-Forwarded-For and X-Real-IP)
+	t.Run("TrustProxyHeaders=false", func(t *testing.T) {
+		handler := &ProxyHandler{
+			BackendAddr:       "127.0.0.1:7171",
+			Logger:            slog.New(slog.NewTextHandler(io.Discard, nil)),
+			TrustProxyHeaders: false, // Default - secure mode
+		}
+
+		tests := []struct {
+			name       string
+			xff        string
+			xri        string
+			remoteAddr string
+			expected   string
+		}{
+			{
+				name:       "Ignores X-Forwarded-For",
+				xff:        "203.0.113.50",
+				remoteAddr: "127.0.0.1:12345",
+				expected:   "127.0.0.1", // Uses RemoteAddr, not XFF
+			},
+			{
+				name:       "Ignores X-Real-IP",
+				xri:        "198.51.100.25",
+				remoteAddr: "127.0.0.1:12345",
+				expected:   "127.0.0.1", // Uses RemoteAddr, not XRI
+			},
+			{
+				name:       "Uses RemoteAddr directly",
+				remoteAddr: "192.168.1.100:54321",
+				expected:   "192.168.1.100",
+			},
+		}
+
+		for _, tt := range tests {
+			t.Run(tt.name, func(t *testing.T) {
+				req := &http.Request{
+					Header:     make(http.Header),
+					RemoteAddr: tt.remoteAddr,
+				}
+				if tt.xff != "" {
+					req.Header.Set("X-Forwarded-For", tt.xff)
+				}
+				if tt.xri != "" {
+					req.Header.Set("X-Real-IP", tt.xri)
+				}
+
+				got := handler.extractClientIP(req)
+				if got != tt.expected {
+					t.Errorf("extractClientIP() = %q, want %q", got, tt.expected)
+				}
+			})
+		}
+	})
 }
 
 func TestProxyHeaderDestination(t *testing.T) {

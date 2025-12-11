@@ -9,14 +9,46 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"nhooyr.io/websocket"
 )
 
 // ProxyHandler handles WebSocket to TCP proxying with PROXY protocol v2 support.
 type ProxyHandler struct {
-	BackendAddr string
-	Logger      *slog.Logger
+	BackendAddr       string
+	Logger            *slog.Logger
+	MaxMessageSize    int64
+	ConnectTimeout    time.Duration
+	ReadTimeout       time.Duration
+	WriteTimeout      time.Duration
+	MaxConnections    int
+	TrustProxyHeaders bool     // Trust X-Forwarded-For/X-Real-IP headers
+	AllowedOrigins    []string // Allowed WebSocket origins (empty = allow all)
+
+	// activeConns tracks the number of active connections for MaxConnections enforcement
+	activeConns atomic.Int64
+}
+
+// NewProxyHandler creates a new ProxyHandler with the given configuration.
+func NewProxyHandler(cfg Config, logger *slog.Logger) *ProxyHandler {
+	return &ProxyHandler{
+		BackendAddr:       cfg.BackendAddr,
+		Logger:            logger,
+		MaxMessageSize:    cfg.MaxMessageSize,
+		ConnectTimeout:    cfg.ConnectTimeout,
+		ReadTimeout:       cfg.ReadTimeout,
+		WriteTimeout:      cfg.WriteTimeout,
+		MaxConnections:    cfg.MaxConnections,
+		TrustProxyHeaders: cfg.TrustProxyHeaders,
+		AllowedOrigins:    cfg.AllowedOrigins,
+	}
+}
+
+// ActiveConnections returns the current number of active connections.
+func (p *ProxyHandler) ActiveConnections() int64 {
+	return p.activeConns.Load()
 }
 
 // ServeHTTP handles incoming WebSocket connections and proxies them to the backend.
@@ -27,21 +59,50 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	logger.Debug("incoming connection", "remote_addr", r.RemoteAddr)
 
-	// Accept WebSocket connection
-	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		// Allow all origins for game clients
-		InsecureSkipVerify: true,
-	})
+	// Check connection limit
+	if p.MaxConnections > 0 {
+		current := p.activeConns.Load()
+		if current >= int64(p.MaxConnections) {
+			logger.Warn("connection limit reached", "max", p.MaxConnections, "current", current)
+			http.Error(w, "too many connections", http.StatusServiceUnavailable)
+			return
+		}
+	}
+
+	// Accept WebSocket connection with origin checking
+	acceptOpts := &websocket.AcceptOptions{}
+	if len(p.AllowedOrigins) == 0 {
+		// No origins configured - allow all (for non-browser clients like game clients)
+		acceptOpts.InsecureSkipVerify = true
+	} else {
+		// Check origin against allowed list
+		acceptOpts.OriginPatterns = p.AllowedOrigins
+	}
+	conn, err := websocket.Accept(w, r, acceptOpts)
 	if err != nil {
 		logger.Error("failed to accept websocket", "error", err)
 		return
 	}
 	defer conn.CloseNow()
 
+	// Track connection count
+	p.activeConns.Add(1)
+	defer p.activeConns.Add(-1)
+
+	// Set message size limit
+	if p.MaxMessageSize > 0 {
+		conn.SetReadLimit(p.MaxMessageSize)
+	}
+
 	logger.Info("websocket connection accepted")
 
-	// Connect to backend TCP server
-	tcpConn, err := net.Dial("tcp", p.BackendAddr)
+	// Connect to backend TCP server with timeout
+	var tcpConn net.Conn
+	if p.ConnectTimeout > 0 {
+		tcpConn, err = net.DialTimeout("tcp", p.BackendAddr, p.ConnectTimeout)
+	} else {
+		tcpConn, err = net.Dial("tcp", p.BackendAddr)
+	}
 	if err != nil {
 		logger.Error("failed to connect to backend", "error", err)
 		conn.Close(websocket.StatusInternalError, "backend unavailable")
@@ -63,6 +124,12 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// Create context for managing goroutines
 	ctx, cancel := context.WithCancel(r.Context())
 	defer cancel()
+
+	// Close TCP connection when context is canceled to unblock any blocking reads
+	go func() {
+		<-ctx.Done()
+		tcpConn.Close()
+	}()
 
 	// Bidirectional pipe
 	var wg sync.WaitGroup
@@ -94,26 +161,31 @@ func (p *ProxyHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	logger.Info("connection closed")
 }
 
-// extractClientIP gets the real client IP from X-Forwarded-For, X-Real-IP, or RemoteAddr.
+// extractClientIP gets the real client IP.
+// If TrustProxyHeaders is true, checks X-Forwarded-For and X-Real-IP headers.
+// Otherwise, uses RemoteAddr directly (secure by default).
 func (p *ProxyHandler) extractClientIP(r *http.Request) string {
-	// Check X-Forwarded-For first (may contain multiple IPs, take the first)
-	if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
-		// X-Forwarded-For can be "client, proxy1, proxy2"
-		parts := strings.Split(xff, ",")
-		if len(parts) > 0 {
-			ip := strings.TrimSpace(parts[0])
-			if ip != "" {
-				return ip
+	// Only trust proxy headers if explicitly configured
+	if p.TrustProxyHeaders {
+		// Check X-Forwarded-For first (may contain multiple IPs, take the first)
+		if xff := r.Header.Get("X-Forwarded-For"); xff != "" {
+			// X-Forwarded-For can be "client, proxy1, proxy2"
+			parts := strings.Split(xff, ",")
+			if len(parts) > 0 {
+				ip := strings.TrimSpace(parts[0])
+				if ip != "" {
+					return ip
+				}
 			}
+		}
+
+		// Check X-Real-IP
+		if xri := r.Header.Get("X-Real-IP"); xri != "" {
+			return strings.TrimSpace(xri)
 		}
 	}
 
-	// Check X-Real-IP
-	if xri := r.Header.Get("X-Real-IP"); xri != "" {
-		return strings.TrimSpace(xri)
-	}
-
-	// Fall back to RemoteAddr
+	// Use RemoteAddr (secure default)
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
 		return r.RemoteAddr
@@ -165,6 +237,11 @@ func (p *ProxyHandler) wsToTCP(ctx context.Context, wsConn *websocket.Conn, tcpC
 			continue
 		}
 
+		// Set write deadline for TCP
+		if p.WriteTimeout > 0 {
+			tcpConn.SetWriteDeadline(time.Now().Add(p.WriteTimeout))
+		}
+
 		_, err = tcpConn.Write(data)
 		if err != nil {
 			return err
@@ -176,12 +253,26 @@ func (p *ProxyHandler) wsToTCP(ctx context.Context, wsConn *websocket.Conn, tcpC
 func (p *ProxyHandler) tcpToWS(ctx context.Context, tcpConn net.Conn, wsConn *websocket.Conn) error {
 	buf := make([]byte, 32*1024) // 32KB buffer
 	for {
+		// Set read deadline for idle timeout (reset after each read)
+		if p.ReadTimeout > 0 {
+			tcpConn.SetReadDeadline(time.Now().Add(p.ReadTimeout))
+		}
+
 		n, err := tcpConn.Read(buf)
 		if err != nil {
 			return err
 		}
 
-		if err := wsConn.Write(ctx, websocket.MessageBinary, buf[:n]); err != nil {
+		// Set write deadline
+		if p.WriteTimeout > 0 {
+			// Use context with timeout for WebSocket write
+			writeCtx, cancel := context.WithTimeout(ctx, p.WriteTimeout)
+			err = wsConn.Write(writeCtx, websocket.MessageBinary, buf[:n])
+			cancel()
+		} else {
+			err = wsConn.Write(ctx, websocket.MessageBinary, buf[:n])
+		}
+		if err != nil {
 			return err
 		}
 	}
