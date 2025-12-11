@@ -34,7 +34,7 @@ BACKEND_ADDR=localhost:7171 ./ws-proxy
 ### Run with Docker
 
 ```bash
-docker run -p 8080:8080 -e BACKEND_ADDR=gameserver:7171 ghcr.io/zippo/ws-proxy:latest
+docker run -p 8080:8080 -e BACKEND_ADDR=gameserver:7171 ghcr.io/zippoxer/ws-proxy:latest
 ```
 
 ### Docker Compose
@@ -42,7 +42,7 @@ docker run -p 8080:8080 -e BACKEND_ADDR=gameserver:7171 ghcr.io/zippo/ws-proxy:l
 ```yaml
 services:
   ws-proxy:
-    image: ghcr.io/zippo/ws-proxy:latest
+    image: ghcr.io/zippoxer/ws-proxy:latest
     ports:
       - "8080:8080"
     environment:
